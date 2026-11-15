@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    {"name": "user_id", "kind": "source"},
+    {"name": "order_amt", "kind": "source"},
+    {"name": "coupon_amt", "kind": "source"},
+    {"name": "net_amt", "kind": "derived",
+     "candidate_groups": [["order_amt", "coupon_amt"]]},
+    {"name": "report_gmv", "kind": "report",
+     "candidate_groups": [["net_amt"], ["order_amt"]]},
+    {"name": "report_user_cnt", "kind": "report",
+     "candidate_groups": [["user_id"]]},
+    {"name": "report_coupon_rate", "kind": "report",
+     "candidate_groups": [["coupon_amt", "order_amt"]]}
+  ]
+}
