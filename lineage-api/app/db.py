@@ -53,6 +53,24 @@ CREATE INDEX IF NOT EXISTS idx_inputs_group
     ON group_inputs(group_id);
 CREATE INDEX IF NOT EXISTS idx_inputs_name
     ON group_inputs(input_name);
+
+-- Published / withdrawn state of a source-field partition for a business date.
+-- Every revision is kept: the effective state of (field_name, biz_date) is the
+-- row with the highest revision. A missing row means "never published".
+CREATE TABLE IF NOT EXISTS partition_status (
+    field_name   TEXT NOT NULL REFERENCES nodes(name),
+    biz_date     TEXT NOT NULL,
+    revision     INTEGER NOT NULL CHECK (revision >= 1),
+    status       TEXT NOT NULL CHECK (status IN ('published', 'withdrawn')),
+    recorded_at  TEXT NOT NULL
+                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (field_name, biz_date, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_partition_date
+    ON partition_status(biz_date);
+CREATE INDEX IF NOT EXISTS idx_partition_field
+    ON partition_status(field_name, biz_date);
 """
 
 

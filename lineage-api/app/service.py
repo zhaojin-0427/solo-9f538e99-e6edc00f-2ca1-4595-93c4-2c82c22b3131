@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 import sys
 from collections import defaultdict
@@ -359,3 +360,288 @@ def get_graph(db_path: str | None = None) -> dict:
     for kind in kinds.values():
         counts[kind] += 1
     return {"nodes": nodes, "counts": counts}
+
+
+# --------------------------------------------------------------------------- #
+# Partition status recording (batch, revision-aware)
+# --------------------------------------------------------------------------- #
+
+def record_partitions(records: list, db_path: str | None = None) -> dict:
+    """Record source-field partition states for a batch, all or nothing.
+
+    Revision rules per (field_name, biz_date):
+    * only the highest revision is effective; a lower revision retransmission
+      is ignored and never rolls the state back;
+    * the same revision with a different status conflicts -> whole batch 409;
+    * the same revision with the same status is an idempotent no-op.
+    Referencing an unregistered node or a non-source field rejects the batch.
+    """
+    # ---- intra-batch duplicate keys: same status folds into one record,
+    #      different status on the same revision is a batch conflict. ----
+    folded: dict[tuple[str, str, int], str] = {}
+    conflicts: list[dict] = []
+    for rec in records:
+        key = (rec.field_name, rec.biz_date, rec.revision)
+        if key in folded and folded[key] != rec.status:
+            conflicts.append(
+                {
+                    "field_name": key[0],
+                    "biz_date": key[1],
+                    "revision": key[2],
+                    "statuses": sorted({folded[key], rec.status}),
+                }
+            )
+        else:
+            folded.setdefault(key, rec.status)
+    if conflicts:
+        raise ConflictLineageError(
+            "同一字段、日期、修订号出现状态冲突，整批未生效",
+            {"revision_conflicts": conflicts},
+        )
+
+    unique_records = [
+        (field_name, biz_date, revision, status)
+        for (field_name, biz_date, revision), status in folded.items()
+    ]
+
+    with db.immediate_write(db_path) as conn:
+        existing_kinds: dict[str, str] = {
+            row["name"]: row["kind"]
+            for row in conn.execute("SELECT name, kind FROM nodes")
+        }
+
+        # ---- referential / kind validation: source fields only ----
+        unknown = sorted(
+            {field_name for field_name, _, _, _ in unique_records
+             if field_name not in existing_kinds}
+        )
+        non_source = sorted(
+            {field_name for field_name, _, _, _ in unique_records
+             if existing_kinds.get(field_name) not in (None, "source")}
+        )
+        problems: dict[str, list] = {}
+        if unknown:
+            problems["unregistered_fields"] = unknown
+        if non_source:
+            problems["non_source_fields"] = non_source
+        if problems:
+            raise ValidationLineageError(
+                "引用了未登记字段或非源字段，整批未生效", problems
+            )
+
+        # ---- decide the outcome of every record before mutating anything ----
+        tuple_placeholders = ",".join("(?,?,?)" for _ in unique_records)
+        keys = [(f, d, r) for f, d, r, _ in unique_records]
+        stored_rows = conn.execute(
+            f"SELECT field_name, biz_date, revision, status "
+            f"FROM partition_status "
+            f"WHERE (field_name, biz_date, revision) IN "
+            f"({tuple_placeholders})",
+            tuple(itertools.chain.from_iterable(keys)),
+        ).fetchall()
+        stored = {
+            (row["field_name"], row["biz_date"], row["revision"]):
+                row["status"]
+            for row in stored_rows
+        }
+
+        # Only (field, date) pairs touched by this batch can be affected.
+        pair_placeholders = ",".join("(?,?)" for _ in unique_records)
+        pairs = [(f, d) for f, d, _, _ in unique_records]
+        max_revision: dict[tuple[str, str], int] = {}
+        if pairs:
+            for row in conn.execute(
+                f"SELECT field_name, biz_date, MAX(revision) AS max_rev "
+                f"FROM partition_status "
+                f"WHERE (field_name, biz_date) IN ({pair_placeholders}) "
+                f"GROUP BY field_name, biz_date",
+                tuple(itertools.chain.from_iterable(pairs)),
+            ):
+                max_revision[(row["field_name"], row["biz_date"])] = (
+                    row["max_rev"]
+                )
+
+        plans: list[tuple[str, str, int, str, str]] = []
+        stored_conflicts: list[dict] = []
+        for field_name, biz_date, revision, status in unique_records:
+            key = (field_name, biz_date, revision)
+            if key in stored:
+                if stored[key] != status:
+                    stored_conflicts.append(
+                        {
+                            "field_name": field_name,
+                            "biz_date": biz_date,
+                            "revision": revision,
+                            "stored_status": stored[key],
+                            "requested_status": status,
+                        }
+                    )
+                else:
+                    plans.append((field_name, biz_date, revision,
+                                  status, "unchanged"))
+                continue
+            if revision < max_revision.get((field_name, biz_date), 0):
+                # Lower revision retransmission: never rolls back.
+                plans.append((field_name, biz_date, revision,
+                              status, "superseded"))
+            else:
+                plans.append((field_name, biz_date, revision,
+                              status, "applied"))
+        if stored_conflicts:
+            raise ConflictLineageError(
+                "同一字段、日期、修订号已存在不同状态，整批未生效",
+                {"revision_conflicts": stored_conflicts},
+            )
+
+        # ---- mutation phase: only genuine new revisions are inserted ----
+        applied = 0
+        for field_name, biz_date, revision, status, outcome in plans:
+            if outcome == "applied":
+                conn.execute(
+                    "INSERT INTO partition_status"
+                    "(field_name, biz_date, revision, status) "
+                    "VALUES(?, ?, ?, ?)",
+                    (field_name, biz_date, revision, status),
+                )
+                applied += 1
+
+    unchanged = sum(1 for *_, o in plans if o == "unchanged")
+    superseded = sum(1 for *_, o in plans if o == "superseded")
+    results = [
+        {
+            "field_name": field_name,
+            "biz_date": biz_date,
+            "revision": revision,
+            "status": status,
+            "outcome": outcome,
+        }
+        for field_name, biz_date, revision, status, outcome in plans
+    ]
+    results.sort(key=lambda item: (item["field_name"], item["biz_date"],
+                                   item["revision"]))
+    return {
+        "received": len(records),
+        "applied": applied,
+        "unchanged": unchanged,
+        "superseded": superseded,
+        "rejected": 0,
+        "results": results,
+        "message": "分区状态批次已提交（整批原子）",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Readiness check against candidate input groups
+# --------------------------------------------------------------------------- #
+
+def _load_partitions(
+    conn: sqlite3.Connection, biz_date: str
+) -> dict[str, sqlite3.Row]:
+    """Effective (highest-revision) partition row of each source on the date."""
+    rows = conn.execute(
+        "SELECT field_name, revision, status FROM partition_status "
+        "WHERE biz_date = ? AND revision = ("
+        "    SELECT MAX(revision) FROM partition_status p2 "
+        "    WHERE p2.field_name = partition_status.field_name "
+        "      AND p2.biz_date = partition_status.biz_date"
+        ")",
+        (biz_date,),
+    ).fetchall()
+    return {row["field_name"]: row for row in rows}
+
+
+def check_readiness(
+    report_column: str, biz_date: str, db_path: str | None = None
+) -> dict:
+    with db.snapshot(db_path) as conn:
+        kinds, groups = load_graph(conn)
+        partitions = _load_partitions(conn, biz_date)
+
+    if report_column not in kinds:
+        raise NotFoundLineageError(
+            "报表列未登记", {"unknown": [report_column]}
+        )
+    if kinds[report_column] != "report":
+        raise ValidationLineageError(
+            "就绪核查目标必须是 report 类型节点",
+            {"report_column": report_column, "kind": kinds[report_column]},
+        )
+
+    sys.setrecursionlimit(_MAX_RECURSION_DEPTH)
+
+    # Availability memo over the lineage graph for this one business date.
+    available: dict[str, bool] = {}
+    # For each unavailable node: source-field names whose partition is missing.
+    root_missing: dict[str, list[str]] = {}
+
+    def is_available(node: str) -> bool:
+        if node in available:
+            return available[node]
+
+        if kinds[node] == "source":
+            row = partitions.get(node)
+            ok = row is not None and row["status"] == "published"
+            available[node] = ok
+            if not ok:
+                root_missing[node] = [node]
+            return ok
+
+        node_groups = groups.get(node, [])
+        group_ok = any(
+            all(is_available(inp) for inp in group) for group in node_groups
+        )
+        available[node] = group_ok
+        if not group_ok:
+            causes: set[str] = set()
+            for group in node_groups:
+                for inp in group:
+                    if not is_available(inp):
+                        causes.update(root_missing.get(inp, [inp]))
+            root_missing[node] = sorted(causes)
+        return group_ok
+
+    column_groups = groups.get(report_column, [])
+    available_groups: list[int] = []
+    blocked_groups: list[dict] = []
+    for idx, group in enumerate(column_groups):
+        if all(is_available(inp) for inp in group):
+            available_groups.append(idx)
+            continue
+        missing_names = sorted({
+            source
+            for inp in group
+            if not is_available(inp)
+            for source in root_missing.get(inp, [inp])
+        })
+        blocked_groups.append(
+            {
+                "group_index": idx,
+                "inputs": list(group),
+                "missing_partitions": [
+                    _missing_partition_view(name, partitions)
+                    for name in missing_names
+                ],
+            }
+        )
+
+    return {
+        "report_column": report_column,
+        "biz_date": biz_date,
+        "ready": bool(available_groups),
+        "available_groups": available_groups,
+        "blocked_groups": blocked_groups,
+    }
+
+
+def _missing_partition_view(
+    source_name: str, partitions: dict
+) -> dict:
+    row = partitions.get(source_name)
+    if row is None:
+        # No record at all -> treated as unpublished.
+        return {"name": source_name, "status": "unpublished", "revision": None}
+    return {
+        "name": source_name,
+        "status": row["status"],  # effective state must be withdrawn here
+        "revision": row["revision"],
+    }

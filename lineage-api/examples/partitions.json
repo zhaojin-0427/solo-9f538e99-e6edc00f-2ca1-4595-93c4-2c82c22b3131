@@ -1,0 +1,10 @@
+{
+  "records": [
+    {"field_name": "order_amt", "biz_date": "2026-11-14",
+     "revision": 1, "status": "published"},
+    {"field_name": "coupon_amt", "biz_date": "2026-11-14",
+     "revision": 1, "status": "published"},
+    {"field_name": "user_id", "biz_date": "2026-11-14",
+     "revision": 1, "status": "published"}
+  ]
+}

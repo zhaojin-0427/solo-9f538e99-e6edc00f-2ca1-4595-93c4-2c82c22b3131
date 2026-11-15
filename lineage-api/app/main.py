@@ -15,6 +15,10 @@ from .models import (
     GraphResponse,
     ImpactRequest,
     ImpactResponse,
+    PartitionBatchRequest,
+    PartitionBatchResponse,
+    ReadinessRequest,
+    ReadinessResponse,
     RegisterRequest,
     RegisterResponse,
 )
@@ -99,3 +103,31 @@ def impact(payload: ImpactRequest) -> dict:
 def graph() -> dict:
     """查看当前已提交的完整血缘快照。"""
     return service.get_graph()
+
+
+# --------------------------------------------------------------------------- #
+# Partition readiness
+# --------------------------------------------------------------------------- #
+
+@app.post(
+    "/readiness/partitions",
+    response_model=PartitionBatchResponse,
+    tags=["readiness"],
+)
+def record_partitions(payload: PartitionBatchRequest) -> dict:
+    """批量记录源字段分区在某业务日期的发布 / 撤回状态与修订号。
+
+    引用未登记或非源字段、同修订状态冲突时整批拒绝；低修订重传不回退，
+    同修订同状态重传幂等。
+    """
+    return service.record_partitions(payload.records)
+
+
+@app.post(
+    "/readiness/check",
+    response_model=ReadinessResponse,
+    tags=["readiness"],
+)
+def readiness(payload: ReadinessRequest) -> dict:
+    """按候选输入组判断报表列在业务日期是否存在完整可用路径。"""
+    return service.check_readiness(payload.report_column, payload.biz_date)
